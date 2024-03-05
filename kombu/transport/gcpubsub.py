@@ -442,7 +442,7 @@ class Channel(virtual.Channel):
             response = self.subscriber.pull(
                 request={
                     'subscription': qdesc.subscription_path,
-                    'max_messages': self.bulk_max_messages,
+                    'max_messages': self.qos.can_consume_max_estimate() or self.bulk_max_messages,
                 },
                 retry=Retry(deadline=self.retry_timeout_seconds),
                 timeout=timeout or self.wait_time_seconds,
@@ -717,7 +717,7 @@ class Transport(virtual.Transport):
     def __init__(self, client, **kwargs):
         super().__init__(client, **kwargs)
         self._pool = ThreadPoolExecutor()
-        self._get_bulk_future_to_queue: Dict[Future, str] = dict()
+        self._queue_pollers: Dict[str, Future] = dict()
 
     def driver_version(self):
         return package_version.__version__
@@ -760,27 +760,20 @@ class Transport(virtual.Transport):
                 break
 
     def _drain_from_active_queues(self, timeout):
-        queues_with_submitted_get_bulk = set(
-            self._get_bulk_future_to_queue.values()
-        )
         for channel in self.channels:
             for queue in channel._active_queues:
-                if queue in queues_with_submitted_get_bulk:
-                    continue
-                future = self._pool.submit(channel._get_bulk, queue, timeout)
-                self._get_bulk_future_to_queue[future] = queue
+                # if there's no active/ready task, submit a new get_bulk task
+                active_poll_request = self._queue_pollers.get(queue)
+                if active_poll_request is None or active_poll_request.exception():
+                    self._queue_pollers[queue] = self._pool.submit(channel._get_bulk, queue, timeout)
 
         done, _ = wait(
-            self._get_bulk_future_to_queue,
+            self._queue_pollers.values(),
             timeout=timeout,
             return_when=FIRST_COMPLETED,
         )
-        empty = {f for f in done if f.exception()}
-        done -= empty
-        for f in empty:
-            self._get_bulk_future_to_queue.pop(f, None)
 
-        if not done:
+        if not done or all(f.exception() for f in done):
             raise Empty()
 
         logger.debug('got %d done get_bulk tasks', len(done))
@@ -790,4 +783,4 @@ class Transport(virtual.Transport):
                 logger.debug('consuming message from queue: %s', queue)
                 self._callbacks[queue](payload)
                 # self._deliver(payload, queue)
-            self._get_bulk_future_to_queue.pop(f, None)
+            self._queue_pollers.pop(queue)
