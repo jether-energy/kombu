@@ -20,12 +20,6 @@ Configuration:
             prefix='kombu/',
             ttl_seconds=86400  # 24 hours
         )
-
-    Environment variables:
-        CLOUDPICKLE_GCS_THRESHOLD: Size threshold in bytes (default: 10MB)
-        CLOUDPICKLE_GCS_BUCKET: GCS bucket name (default: 'kombu-large-payloads')
-        CLOUDPICKLE_GCS_PREFIX: Object prefix (default: 'kombu')
-        CLOUDPICKLE_GCS_TTL: Auto-cleanup TTL in seconds (default: 86400 = 24 hours)
 """
 from __future__ import absolute_import
 
@@ -39,15 +33,11 @@ from .five import BytesIO, text_t, bytes_t
 
 __all__ = ['register_cloudpickle_gcs', 'CloudPickleGCSConfig']
 
-# Configuration
-CLOUDPICKLE_GCS_THRESHOLD = int(
-    os.environ.get('CLOUDPICKLE_GCS_THRESHOLD', 10 * 1024 * 1024)
-)  # 10MB default
-CLOUDPICKLE_GCS_BUCKET = os.environ.get(
-    'CLOUDPICKLE_GCS_BUCKET', 'kombu-large-payloads'
-)
-CLOUDPICKLE_GCS_PREFIX = os.environ.get('CLOUDPICKLE_GCS_PREFIX', 'kombu')
-CLOUDPICKLE_GCS_TTL = int(os.environ.get('CLOUDPICKLE_GCS_TTL', 86400))
+# Default Configuration values
+CLOUDPICKLE_GCS_THRESHOLD_DEFAULT = 10 * 1024 * 1024 - 1024 # (10MB - 1KB buffer)
+CLOUDPICKLE_GCS_BUCKET_DEFAULT = 'kombu-large-payloads'
+CLOUDPICKLE_GCS_PREFIX_DEFAULT = 'kombu'
+CLOUDPICKLE_GCS_TTL_DEFAULT =  86400  # 24 hours
 
 # Marker for GCS reference payloads
 GCS_REF_TYPE = b'__cld_pkl_gcs_ref__'
@@ -133,7 +123,7 @@ class CloudPickleGCSConfig(object):
         """
         if cls._config['threshold'] is not None:
             return cls._config['threshold']
-        return CLOUDPICKLE_GCS_THRESHOLD
+        return CLOUDPICKLE_GCS_THRESHOLD_DEFAULT
 
     @classmethod
     def get_bucket(cls):
@@ -144,7 +134,7 @@ class CloudPickleGCSConfig(object):
         """
         if cls._config['bucket'] is not None:
             return cls._config['bucket']
-        return CLOUDPICKLE_GCS_BUCKET
+        return CLOUDPICKLE_GCS_BUCKET_DEFAULT
 
     @classmethod
     def get_prefix(cls):
@@ -155,7 +145,7 @@ class CloudPickleGCSConfig(object):
         """
         if cls._config['prefix'] is not None:
             return cls._config['prefix']
-        return CLOUDPICKLE_GCS_PREFIX
+        return CLOUDPICKLE_GCS_PREFIX_DEFAULT
 
     @classmethod
     def get_ttl_seconds(cls):
@@ -166,7 +156,7 @@ class CloudPickleGCSConfig(object):
         """
         if cls._config['ttl_seconds'] is not None:
             return cls._config['ttl_seconds']
-        return CLOUDPICKLE_GCS_TTL
+        return CLOUDPICKLE_GCS_TTL_DEFAULT
 
 
 class GCSStorageBackend(object):
@@ -326,7 +316,7 @@ class GCSStorageBackend(object):
 _gcs_backend = GCSStorageBackend()
 
 
-def cloudpickle_gcs_dumps(obj, threshold=CLOUDPICKLE_GCS_THRESHOLD):
+def cloudpickle_gcs_dumps(obj, threshold=CLOUDPICKLE_GCS_THRESHOLD_DEFAULT):
     """Serialize object with cloudpickle, optionally offloading to GCS.
 
     Args:
