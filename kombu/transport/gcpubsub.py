@@ -174,7 +174,7 @@ class Channel(virtual.Channel):
     default_expiration_seconds = 86400
     default_retry_timeout_seconds = 300
     default_bulk_max_messages = 100
-    default_pubsub_api_transport = 'rest'
+    default_pubsub_api_transport = 'grpc'
 
     _min_ack_deadline = 10
     _fanout_exchanges = set()
