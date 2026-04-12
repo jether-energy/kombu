@@ -364,11 +364,13 @@ class Channel(virtual.Channel):
             routing_key,
         )
         encoded_message = dumps(message)
-        self.publisher.publish(
+        publish_future = self.publisher.publish(
             qdesc.topic_path,
             encoded_message.encode("utf-8"),
             routing_key=routing_key,
+            retry=Retry(deadline=self.retry_timeout_seconds),
         )
+        publish_future.result(timeout=self.retry_timeout_seconds)
 
     def _put_fanout(self, exchange, message, routing_key, **kwargs):
         """Put message onto fanout exchange."""
@@ -380,11 +382,12 @@ class Channel(virtual.Channel):
             topic_path,
         )
         encoded_message = dumps(message)
-        self.publisher.publish(
+        publish_future = self.publisher.publish(
             topic_path,
             encoded_message.encode("utf-8"),
             retry=Retry(deadline=self.retry_timeout_seconds),
         )
+        publish_future.result(timeout=self.retry_timeout_seconds)
 
     def _get(self, queue: str, timeout: float = None):
         """Retrieves a single message from a queue."""
