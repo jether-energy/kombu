@@ -50,7 +50,7 @@ from concurrent.futures import (FIRST_COMPLETED, Future, ThreadPoolExecutor,
                                 wait)
 from contextlib import suppress
 from os import getpid
-from queue import Empty
+from queue import Empty, Queue
 from threading import Lock
 from time import monotonic, sleep
 from typing import Dict
@@ -180,6 +180,9 @@ class Channel(virtual.Channel):
     _fanout_exchanges = set()
     _unacked_extender: threading.Thread = None
     _stop_extender = threading.Event()
+    _publish_waiter: threading.Thread = None
+    _stop_publish_waiter = threading.Event()
+    _pending_publish_futures: Queue = Queue()
     _n_channels = AtomicCounter()
     _queue_cache: dict[str, QueueDescriptor] = {}
     _tmp_subscriptions: set[str] = set()
@@ -197,6 +200,12 @@ class Channel(virtual.Channel):
             )
             self._stop_extender.clear()
             Channel._unacked_extender.start()
+            Channel._publish_waiter = threading.Thread(
+                target=self._wait_for_publish_futures,
+                daemon=True,
+            )
+            self._stop_publish_waiter.clear()
+            Channel._publish_waiter.start()
 
     def entity_name(self, name: str, table=CHARS_REPLACE_TABLE) -> str:
         """Format AMQP queue name into a valid Pub/Sub queue name."""
@@ -364,11 +373,13 @@ class Channel(virtual.Channel):
             routing_key,
         )
         encoded_message = dumps(message)
-        self.publisher.publish(
+        publish_future = self.publisher.publish(
             qdesc.topic_path,
             encoded_message.encode("utf-8"),
             routing_key=routing_key,
+            retry=Retry(deadline=self.retry_timeout_seconds),
         )
+        self._pending_publish_futures.put(publish_future)
 
     def _put_fanout(self, exchange, message, routing_key, **kwargs):
         """Put message onto fanout exchange."""
@@ -380,11 +391,12 @@ class Channel(virtual.Channel):
             topic_path,
         )
         encoded_message = dumps(message)
-        self.publisher.publish(
+        publish_future = self.publisher.publish(
             topic_path,
             encoded_message.encode("utf-8"),
             retry=Retry(deadline=self.retry_timeout_seconds),
         )
+        self._pending_publish_futures.put(publish_future)
 
     def _get(self, queue: str, timeout: float = None):
         """Retrieves a single message from a queue."""
@@ -620,6 +632,23 @@ class Channel(virtual.Channel):
             'unacked deadline extension thread [%s] stopped', thread_id
         )
 
+    def _wait_for_publish_futures(self):
+        thread_id = threading.get_native_id()
+        logger.info('publish waiter thread [%s] started', thread_id)
+        while not self._stop_publish_waiter.is_set():
+            try:
+                future = self._pending_publish_futures.get(timeout=1)
+            except Empty:
+                continue
+            try:
+                future.result(timeout=self.retry_timeout_seconds)
+            except Exception as exc:
+                logger.error(
+                    'thread [%s]: publish failed: %s',
+                    thread_id, exc, exc_info=True,
+                )
+        logger.info('publish waiter thread [%s] stopped', thread_id)
+
     def after_reply_message_received(self, queue: str):
         queue = self.entity_name(queue)
         sub = self.subscriber.subscription_path(self.project_id, queue)
@@ -707,6 +736,8 @@ class Channel(virtual.Channel):
         if not self._n_channels.dec():
             self._stop_extender.set()
             Channel._unacked_extender.join()
+            self._stop_publish_waiter.set()
+            Channel._publish_waiter.join()
         super().close()
 
     @staticmethod
