@@ -11,6 +11,8 @@ from google.api_core.exceptions import (AlreadyExists, DeadlineExceeded,
                                         PermissionDenied)
 from google.pubsub_v1.types.pubsub import Subscription
 
+from uuid import NAMESPACE_OID
+
 from kombu.transport.gcpubsub import (AtomicCounter, Channel, QueueDescriptor,
                                       Transport, UnackedIds)
 
@@ -157,6 +159,7 @@ class test_Channel:
             subscription_path=subscription_path,
             filter_args={'filter': f'attributes.routing_key="{routing_key}"'},
             msg_retention=channel.expiration_seconds,
+            seek_if_exists=False,
         )
         assert channel.entity_name(queue) in channel._queue_cache
 
@@ -179,6 +182,7 @@ class test_Channel:
         )
         channel._create_topic = MagicMock(return_value='topic_path')
         channel._create_subscription = MagicMock()
+        channel.stable_fanout_subscriptions = False
 
         # Mock the state and exchange type
         mock_connection = MagicMock(name='mock_connection')
@@ -197,10 +201,32 @@ class test_Channel:
             subscription_path=subscription_path,
             filter_args={},
             msg_retention=600,
+            seek_if_exists=False,
         )
+        mock_uuid.assert_called_once_with(NAMESPACE_OID, 'hostname.1234')
         assert channel.entity_name(queue) in channel._queue_cache
         assert subscription_path in channel._tmp_subscriptions
         assert exchange in channel._fanout_exchanges
+
+    @patch('kombu.transport.gcpubsub.uuid3', return_value='uuid')
+    @patch('kombu.transport.gcpubsub.gethostname', return_value='hostname')
+    @patch('kombu.transport.gcpubsub.getpid', return_value=1234)
+    def test_queue_bind_fanout_stable_subscription(
+        self, mock_pid, mock_hostname, mock_uuid, channel
+    ):
+        exchange = 'test_exchange'
+        channel._create_topic = MagicMock(return_value='topic_path')
+        channel._create_subscription = MagicMock()
+        channel.stable_fanout_subscriptions = True
+        channel.state.exchanges = {exchange: {'type': 'fanout'}}
+        channel.exchange_types = {'fanout': MagicMock(type='fanout')}
+
+        channel._queue_bind(exchange, 'key', None, 'test_queue')
+
+        mock_uuid.assert_called_once_with(NAMESPACE_OID, 'hostname')
+        assert channel._create_subscription.call_args.kwargs[
+            'seek_if_exists'
+        ]
 
     def test_queue_bind_not_implemented(self, channel):
         exchange = 'test_exchange'
@@ -284,6 +310,26 @@ class test_Channel:
         assert result == subscription_path
         channel.subscriber.create_subscription.assert_called_once()
 
+    @pytest.mark.parametrize('seek_if_exists', [True, False])
+    def test_create_subscription_seeks_existing(self, channel, seek_if_exists):
+        channel.subscriber.create_subscription = MagicMock(
+            side_effect=AlreadyExists('exists')
+        )
+        channel._create_subscription(
+            topic_path='topic_path',
+            subscription_path='subscription_path',
+            seek_if_exists=seek_if_exists,
+        )
+        assert channel.subscriber.seek.called == seek_if_exists
+
+    def test_create_subscription_new_is_not_seeked(self, channel):
+        channel._create_subscription(
+            topic_path='topic_path',
+            subscription_path='subscription_path',
+            seek_if_exists=True,
+        )
+        channel.subscriber.seek.assert_not_called()
+
     def test_create_subscription_protobuf_compat(self):
         request = {
             'name': 'projects/my_project/subscriptions/kombu-1111-2222',
@@ -339,13 +385,22 @@ class test_Channel:
         routing_key = "test_key"
 
         channel._lookup = MagicMock()
+        channel._queue_bind = MagicMock()
+        channel._create_topic = MagicMock()
+        channel._fanout_topics = set()
         channel.publisher.topic_path = MagicMock(return_value="topic_path")
         channel.publisher.publish = MagicMock()
 
         channel._put_fanout(exchange, message, routing_key)
+        channel._put_fanout(exchange, message, routing_key)
 
-        channel._lookup.assert_called_once_with(exchange, routing_key)
-        channel.publisher.topic_path.assert_called_once_with(
+        channel._lookup.assert_not_called()
+        channel._queue_bind.assert_not_called()
+        channel._create_topic.assert_called_once_with(
+            channel.project_id, exchange, 600
+        )
+        assert channel.publisher.publish.call_count == 2
+        channel.publisher.topic_path.assert_called_with(
             channel.project_id, exchange
         )
         assert 'topic_path', (
@@ -597,6 +652,34 @@ class test_Channel:
             channel.subscriber.modify_ack_deadline.call_count
             == modify_ack_deadline_calls
         )
+
+    def test_extend_unacked_deadline_survives_concurrent_bind(self, channel):
+        def bind_another_queue(request):
+            channel._queue_cache['kombu-other'] = QueueDescriptor(
+                name='kombu-other',
+                topic_path='topic',
+                subscription_id='other',
+                subscription_path='other_path',
+            )
+
+        for name in ('first', 'second'):
+            qdesc = QueueDescriptor(
+                name=name,
+                topic_path='topic',
+                subscription_id=name,
+                subscription_path=f'{name}_path',
+            )
+            qdesc.unacked_ids.append(f'{name}_ack')
+            channel._queue_cache[channel.entity_name(name)] = qdesc
+        channel.transport_options = {'ack_deadline_seconds': 240}
+        channel._stop_extender.wait = MagicMock(side_effect=[False, True])
+        channel.subscriber.modify_ack_deadline = MagicMock(
+            side_effect=bind_another_queue
+        )
+
+        channel._extend_unacked_deadline()
+
+        assert channel.subscriber.modify_ack_deadline.call_count == 2
 
     def test_extend_unacked_deadline_handles_exception(self, channel):
         """Test that exceptions in modify_ack_deadline don't crash the thread."""
