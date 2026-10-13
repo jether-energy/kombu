@@ -194,6 +194,9 @@ class Channel(virtual.Channel):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # per channel, so closing one channel deletes only the subscriptions
+        # it bound, not those of other connections in the process
+        self._tmp_subscriptions: set[str] = set()
         self.pool = ThreadPoolExecutor()
         logger.info('new GCP pub/sub channel: %s', self.conninfo.hostname)
 

@@ -830,6 +830,19 @@ class test_Channel:
             'bulk_max_messages'
         )
 
+    @patch('kombu.transport.gcpubsub.Transport.parse_uri',
+           return_value='project')
+    @patch('kombu.transport.gcpubsub.ThreadPoolExecutor')
+    @patch('kombu.transport.virtual.Channel.__init__', return_value=None)
+    def test_temp_subscriptions_are_per_channel(self, *mocks):
+        with patch.object(Channel, 'conninfo', new_callable=MagicMock), \
+                patch.object(Channel, '_n_channels') as n_channels:
+            n_channels.inc.return_value = 2
+            first, second = Channel(MagicMock()), Channel(MagicMock())
+        first._tmp_subscriptions.add('first_sub')
+
+        assert second._tmp_subscriptions == set()
+
     def test_close(self, channel):
         channel._tmp_subscriptions = {'sub1', 'sub2'}
         channel._n_channels.dec.return_value = 0
