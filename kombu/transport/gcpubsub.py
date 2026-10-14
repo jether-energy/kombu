@@ -38,6 +38,12 @@ Transport Options
 * ``pubsub_api_transport``: (str) The transport protocol to use for
   Pub/Sub API calls. Valid values are 'rest', 'grpc', or 'grpc_asyncio'.
   Defaults to 'rest'.
+* ``stable_fanout_subscriptions``: (bool) Name a fanout queue's subscription
+  after the queue and host only, without the process id, so it can be created
+  ahead of the process that consumes it. Binding to one that already exists
+  seeks it to the current time, dropping messages left over from an earlier
+  process.
+  Defaults to False.
 """
 
 from __future__ import annotations
@@ -177,15 +183,20 @@ class Channel(virtual.Channel):
     default_pubsub_api_transport = 'grpc'
 
     _min_ack_deadline = 10
+    fanout_message_retention = 600
     _fanout_exchanges = set()
     _unacked_extender: threading.Thread = None
     _stop_extender = threading.Event()
     _n_channels = AtomicCounter()
     _queue_cache: dict[str, QueueDescriptor] = {}
     _tmp_subscriptions: set[str] = set()
+    _fanout_topics: set[str] = set()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # per channel, so closing one channel deletes only the subscriptions
+        # it bound, not those of other connections in the process
+        self._tmp_subscriptions: set[str] = set()
         self.pool = ThreadPoolExecutor()
         logger.info('new GCP pub/sub channel: %s', self.conninfo.hostname)
 
@@ -238,14 +249,17 @@ class Channel(virtual.Channel):
             #    -subscription:'fanout1-uuid' on topic 'test_fanout'
             #  -bound queue 'fanout2':
             #    -subscription:'fanout2-uuid' on topic 'test_fanout'
-            uid = f'{uuid3(NAMESPACE_OID, f"{gethostname()}.{getpid()}")}'
+            owner = gethostname()
+            if not self.stable_fanout_subscriptions:
+                owner = f'{owner}.{getpid()}'
+            uid = f'{uuid3(NAMESPACE_OID, owner)}'
             uniq_sub_name = f'{queue}-{uid}'
             subscription_path = self.subscriber.subscription_path(
                 self.project_id, uniq_sub_name
             )
             self._tmp_subscriptions.add(subscription_path)
             self._fanout_exchanges.add(exchange)
-            message_retention_duration = 600
+            message_retention_duration = self.fanout_message_retention
         else:
             raise NotImplementedError(
                 f'exchange type {exchange_type} not implemented'
@@ -258,6 +272,9 @@ class Channel(virtual.Channel):
             subscription_path=subscription_path,
             filter_args=filter_args,
             msg_retention=message_retention_duration,
+            seek_if_exists=(
+                exchange_type == 'fanout' and self.stable_fanout_subscriptions
+            ),
         )
         qdesc = QueueDescriptor(
             name=queue,
@@ -305,6 +322,7 @@ class Channel(virtual.Channel):
         subscription_path: str = None,
         filter_args=None,
         msg_retention: int = None,
+        seek_if_exists: bool = False,
     ) -> str:
         subscription_path = (
             subscription_path
@@ -334,7 +352,14 @@ class Channel(virtual.Channel):
                 }
             )
         except (AlreadyExists, Conflict):
-            pass
+            if seek_if_exists:
+                logger.debug('seeking %s to now', subscription_path)
+                self.subscriber.seek(
+                    request={
+                        'subscription': subscription_path,
+                        'time': datetime.datetime.now(datetime.timezone.utc),
+                    }
+                )
         return subscription_path
 
     def _delete(self, queue, *args, **kwargs):
@@ -372,8 +397,14 @@ class Channel(virtual.Channel):
 
     def _put_fanout(self, exchange, message, routing_key, **kwargs):
         """Put message onto fanout exchange."""
-        self._lookup(exchange, routing_key)
+        # the subscriptions of the exchange's bound queues receive what is
+        # published to its topic, so publishing needs no binding of its own
         topic_path = self.publisher.topic_path(self.project_id, exchange)
+        if topic_path not in self._fanout_topics:
+            self._create_topic(
+                self.project_id, exchange, self.fanout_message_retention
+            )
+            self._fanout_topics.add(topic_path)
         logger.debug(
             'putting msg to fanout exchange: %s, topic: %s',
             exchange,
@@ -585,7 +616,8 @@ class Channel(virtual.Channel):
         min_deadline_sleep = self._min_ack_deadline / 2
         sleep_time = max(min_deadline_sleep, self.ack_deadline_seconds / 4)
         while not self._stop_extender.wait(sleep_time):
-            for qdesc in self._queue_cache.values():
+            # binding a queue adds to the cache while this thread iterates
+            for qdesc in list(self._queue_cache.values()):
                 if len(qdesc.unacked_ids) == 0:
                     logger.debug(
                         'thread [%s]: no unacked messages for %s',
@@ -674,6 +706,12 @@ class Channel(virtual.Channel):
     def expiration_seconds(self):
         return self.transport_options.get(
             'expiration_seconds', self.default_expiration_seconds
+        )
+
+    @cached_property
+    def stable_fanout_subscriptions(self):
+        return bool(
+            self.transport_options.get('stable_fanout_subscriptions', False)
         )
 
     @cached_property
